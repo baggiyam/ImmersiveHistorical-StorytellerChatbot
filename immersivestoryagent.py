@@ -1,34 +1,35 @@
 import os
 import time
+import json
+import re
+import uuid
 from dotenv import load_dotenv
 from openai import OpenAI
-# import Pinecone  <-- REMOVE THIS LINE
-from langchain_openai import ChatOpenAI
+import pinecone  # NEW correct import for Pinecone client
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-# from context_format import retrieve_context, format_context # Assuming these are defined within this file or elsewhere
-from SimpleConversationMemory import SimpleConversationMemory
-import json
-from pathlib import Path
-from pinecone import Pinecone, ServerlessSpec # <-- KEEP THIS LINE
-import uuid
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Pinecone as PineconeVectorStore
 from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema
-import re
+from SimpleConversationMemory import SimpleConversationMemory
 import pyttsx3
-import uuid
 from IPython.display import Audio, display
 
+# Initialize Pinecone with API key
+load_dotenv()
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
+pinecone_env = os.getenv("PINECONE_ENVIRONMENT")  # If you have environment variable
 
-import pyttsx3
+pinecone.init(api_key=pinecone_api_key, environment=pinecone_env)
+
+INDEX_NAME = "preprocessed-transcripts"
+
+if INDEX_NAME not in pinecone.list_indexes():
+    raise FileNotFoundError(f"Pinecone index '{INDEX_NAME}' not found.")
+
+pinecone_index = pinecone.Index(INDEX_NAME)
 
 def speak_text(text: str, rate: int = 150, volume: float = 0.9):
-    """Speak the given text aloud (non‑blocking). Keeps original prints intact."""
     if not text:
         return
     try:
@@ -38,40 +39,7 @@ def speak_text(text: str, rate: int = 150, volume: float = 0.9):
         engine.say(text)
         engine.runAndWait()
     except Exception as e:
-        # If TTS fails, just continue without crashing the program
         print("[TTS error]", e)
-
-
-def safe_parse_json(llm_output: str):
-    try:
-        return json.loads(llm_output)
-    except json.JSONDecodeError:
-        cleaned = llm_output.strip()
-        cleaned = re.sub(r"(?<!\\)\\n", "\\\\\\\\n", cleaned)
-        cleaned = re.sub(r"(?<!\\)\\", r"\\\\\\\\", cleaned)
-        cleaned = re.sub(r"\n", "\\\\n", cleaned)
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print("❌ Still can't parse JSON after cleaning:", e)
-            print("🧾 Raw output:", llm_output)
-            return None
-
-def speak_text(text, rate=150, volume=0.9):
-    try:
-        engine = pyttsx3.init()
-        engine.setProperty('rate', rate)
-        engine.setProperty('volume', volume)
-
-        # Generate unique file name
-        filename = f"/mnt/data/narration_{uuid.uuid4().hex}.wav"
-        engine.save_to_file(text, filename)
-        engine.runAndWait()
-
-        # Play audio in notebook
-        display(Audio(filename))
-    except Exception as e:
-        print("Narration failed:", e)
 
 def safe_parse_json(llm_output: str):
     try:
@@ -84,10 +52,9 @@ def safe_parse_json(llm_output: str):
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
-            print("❌ Still can't parse JSON after cleaning:", e) # Removed style.RED/style.RESET as style is not defined
-            print("🧾 Raw output:", llm_output) # Removed style.YELLOW/style.RESET as style is not defined
+            print("❌ Still can't parse JSON after cleaning:", e)
+            print("🧾 Raw output:", llm_output)
             return None
-
 
 def retrieve_context(pinecone_index, query_text, openai_client, top_k=5):
     query_embedding_response = openai_client.embeddings.create(
@@ -129,18 +96,9 @@ def format_context(documents):
 class ImmersiveStoryAgent:
     def __init__(self):
         load_dotenv()
-
         self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        if not pinecone_api_key:
-            raise ValueError("PINECONE_API_KEY not set.")
-
-        pc = Pinecone(api_key=pinecone_api_key)
-        self.index_name = "preprocessed-transcripts"
-        if self.index_name not in [index.name for index in pc.list_indexes()]:
-            raise FileNotFoundError(f"Pinecone index '{self.index_name}' not found.")
-        self.pinecone_index = pc.Index(self.index_name)
+        self.pinecone_index = pinecone_index
 
         self.llm = ChatOpenAI(
             model="gpt-4",
@@ -203,8 +161,6 @@ Answer:"""
 
     def generate_story(self, destination):
         session_id = destination.lower().strip()
-
-        # Augment query with recent context for follow-ups
         if self.memory.is_likely_followup(destination):
             recent_context = self.memory.get_recent_context(session_id)
             augmented_query = (recent_context + "\n\n" + destination) if recent_context else destination
@@ -236,11 +192,10 @@ Answer:"""
                 raise ValueError("Missing expected keys in story output")
 
             self.memory.add_qa_pair(destination, parsed['story'], session_id)
-
             return parsed
         except Exception as e:
             print("❌ Error during story generation:", e)
-            import traceback # Import traceback here as it's only used in the exception
+            import traceback
             traceback.print_exc()
             return {
                 "story": "An error occurred while generating the story.",
@@ -260,11 +215,11 @@ Answer:"""
         context, _ = format_context(matches)
 
         try:
-          answer = self.qa_chain.invoke({
-           "question": augmented_query,
-              "context": context
-}).content
-
+            answer = self.qa_chain.invoke({
+                "question": augmented_query,
+                "context": context
+            }).content
+            return answer
         except Exception as e:
             print("❌ Error during answering:", e)
             return "I can't answer that based on the available context."
@@ -301,76 +256,29 @@ def main():
     agent = ImmersiveStoryAgent()
     print("🎭 Welcome to Immersive Storytelling!")
     print("🌍 Where would you like to go today?")
-    print("   ✨ Options: Great Pyramids, Roman Forum, Ancient Greece, Machu Picchu, Mesopotamia, Sangam Tamil Civilization")
-    print("-" * 50)
-
-    current_topic = None
-    story_output = None
-    follow_up_question = None
-    follow_up_mode = False
+    print("   ✨ Options: Great Pyramids, Roman Forum, Athens Acropolis, or ask a history question.")
 
     while True:
-        user_input = input("\n🧭 Your input (type 'exit' to quit, 'back' to choose a new place): ").strip()
-
-        if not user_input:
-            continue
-        if user_input.lower() in ["exit", "quit"]:
-            print("👋 Thanks for exploring with us!")
+        user_input = input("\nYour input (or 'exit' to quit): ").strip()
+        if user_input.lower() in ['exit', 'quit']:
+            print("Goodbye! Hope you enjoyed the journey.")
             break
-        elif user_input.lower() == "back":
-            if current_topic:
-                agent.memory.clear_session(current_topic.lower().strip())
-            current_topic = None
-            story_output = None
-            follow_up_question = None
-            follow_up_mode = False
-            print("🔄 Let's pick a new destination!")
-            continue
-
-        if user_input.lower() == "yes" and follow_up_question and follow_up_mode:
-            answer = agent.answer_question(current_topic, follow_up_question)
-            print("\n💬 Answer:\n", answer)
-            follow_up_mode = False
-            continue
-
-        if current_topic is None or (not is_question(user_input) and not follow_up_mode):
-            current_topic = user_input
-            story_output = agent.generate_story(current_topic)
-
-            print("\n📚 Your Immersive Journey Begins:\n")
-            print("📝 Story:\n", story_output.get("story", "No story generated."))
-
-            if story_output.get("video_references"):
-                print("\n🎬 Referenced Videos:", ", ".join(story_output["video_references"]))
-            else:
-                print("📼 No specific video references.")
-
-            follow_up_question = agent.ask_follow_up(current_topic)
-
-            if follow_up_question and follow_up_question.lower() != "no suitable follow-up question found.":
-                print(f"\n🤔 Follow-up: do you want to know {follow_up_question}? (yes/no)")
-                follow_up_mode = True
-            else:
-                follow_up_mode = False
-            continue
 
         if is_question(user_input):
-            answer = agent.answer_question(current_topic, user_input)
-            print("\n💬 Answer:\n", answer)
-            follow_up_mode = False
+            print("🤔 Answering your question...")
+            answer = agent.answer_question("history", user_input)
+            print(f"🗣️ Answer:\n{answer}")
+            speak_text(answer)
         else:
-            enriched_topic = f"{current_topic} {user_input}"
-            story_output = agent.generate_story(enriched_topic)
-            print("\n📖 The Story Continues:\n")
-            print("📝 Story:\n", story_output.get("story", "No story generated."))
+            print("📜 Generating your immersive story...")
+            result = agent.generate_story(user_input)
+            story_text = result.get("story", "Sorry, no story available.")
+            print(f"\n📖 Immersive Story:\n{story_text}")
+            speak_text(story_text)
 
-            follow_up_question = agent.ask_follow_up(current_topic)
-
-            if follow_up_question and follow_up_question.lower() != "no suitable follow-up question found.":
-                print(f"\n🤔 Follow-up: do you want to know {follow_up_question}? (yes/no)")
-                follow_up_mode = True
-            else:
-                follow_up_mode = False
+            follow_up = agent.ask_follow_up(user_input)
+            if follow_up and follow_up.lower() != "no suitable follow-up question found.":
+                print(f"\n💡 Suggested follow-up question: {follow_up}")
 
 if __name__ == "__main__":
     main()

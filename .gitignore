@@ -1,0 +1,14 @@
+env/
+.env
+venv/
+.venv/
+ImmersiveStoryTelling/audio_filesvenv/
+venv/
+__pycache__/
+*.pyc
+*.pkl
+*.zip
+*.mp4
+*.csv
+ImmersiveStoryTelling/audio_files/
+./Users/bshanmugam/Documents/ImmersiveHistorical-StorytellerChatbot/transcripts/Users/bshanmugam/Documents/FinalStory/ImmersiveHistorical-StorytellerChatbot/audio_files

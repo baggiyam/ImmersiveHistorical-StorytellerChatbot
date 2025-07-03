@@ -1,5 +1,6 @@
 import pinecone
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_community.embeddings import OpenAIEmbeddings
+
 
 # Embed and query Pinecone
 def retrieve_context(index, query, openai_client, cache, top_k=5):
