@@ -4,43 +4,59 @@ import time
 from dotenv import load_dotenv
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-from SimpleConversationMemory import SimpleConversationMemory
-import json
-from pathlib import Path
-import uuid
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Pinecone as PineconeVectorStore
 from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain.output_parsers import StructuredOutputParser, ResponseSchema
 import re
 import pyttsx3
-from IPython.display import Audio, display # Note: IPython.display is for Jupyter/IPython environments. Will not work in a pure Python script without adjustments.
+import uuid
+import json
+import traceback
+### Options: Great Pyramids, Roman Forum, Ancient Greece, Machu Picchu, Mesopotamia, Sangam Tamil Civilization, Rome
+# === TTSManager class ===
+class TTSManager:
+    def __init__(self, rate=150, volume=0.9):
+        self.engine = pyttsx3.init()
+        self.engine.setProperty("rate", rate)
+        self.engine.setProperty("volume", volume)
+        self.speaking = False  # Track if speech is active
 
-# --- Functions from your original script ---
+    def speak(self, text):
+        if not text:
+            return
+        try:
+            self.speaking = True
+            self.engine.say(text)
+            self.engine.runAndWait()
+            self.speaking = False
+        except Exception as e:
+            print("[TTS error]", e)
+            self.speaking = False
 
-def speak_text(text: str, rate: int = 150, volume: float = 0.9):
-    """Speak the given text aloud (non‑blocking). Keeps original prints intact."""
-    if not text:
-        return
-    try:
-        engine = pyttsx3.init()
-        engine.setProperty("rate", rate)
-        engine.setProperty("volume", volume)
-        engine.say(text)
-        engine.runAndWait()
-    except Exception as e:
-        print("[TTS error]", e)
+    def stop(self):
+        if self.speaking:
+            self.engine.stop()
+            self.speaking = False
+            print("Audio stopped.")
 
+
+# Instantiate a single global TTS manager
+tts_manager = TTSManager()
+
+
+# === Safe JSON parser ===
 def safe_parse_json(llm_output: str):
     try:
         return json.loads(llm_output)
     except json.JSONDecodeError:
         cleaned = llm_output.strip()
-        cleaned = re.sub(r"(?<!\\)\\n", "\\\\\\\\n", cleaned)
-        cleaned = re.sub(r"(?<!\\)\\", r"\\\\\\\\", cleaned)
-        cleaned = re.sub(r"\n", "\\\\n", cleaned)
+        cleaned = re.sub(r"(?<!\\)\\n", "\\\\n", cleaned)
+        cleaned = re.sub(r"(?<!\\)\\", r"\\\\", cleaned)
+        cleaned = re.sub(r"\n", "\\n", cleaned)
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as e:
@@ -48,81 +64,88 @@ def safe_parse_json(llm_output: str):
             print("🧾 Raw output:", llm_output)
             return None
 
-def retrieve_context(pinecone_index, query_text, openai_client, top_k=5):
-    query_embedding_response = openai_client.embeddings.create(
-        model="text-embedding-ada-002",
-        input=[query_text]
-    )
-    query_embedding = query_embedding_response.data[0].embedding
 
-    results = pinecone_index.query(
-        vector=query_embedding,
-        top_k=top_k,
-        include_metadata=True
-    )
+# === Conversation memory ===
+class SimpleConversationMemory:
+    def __init__(self, max_history=4):
+        self.max_history = max_history
+        self.history = []
 
-    retrieved_documents = []
-    for match in results.matches:
-        retrieved_documents.append(
-            Document(
-                page_content=match.metadata.get('text', ''),
-                metadata={
-                    "video_id": match.metadata.get('video_id', 'Unknown ID'),
-                    "video_title": match.metadata.get('video_title', 'Unknown Video'),
-                    "score": match.score
-                }
-            )
+    def add_qa_pair(self, question, answer, topic=None):
+        self.history.append({
+            'question': question,
+            'answer': answer,
+            'topic': topic,
+            'timestamp': time.time()
+        })
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+    def get_recent(self, count=1):
+        return self.history[-count:] if self.history else []
+
+
+# === Context retrieval functions ===
+def retrieve_context(index, query, oa_client, top_k=5):
+    emb = oa_client.embeddings.create(
+        model="text-embedding-ada-002", input=[query]
+    ).data[0].embedding
+
+    res = index.query(vector=emb, top_k=top_k, include_metadata=True)
+    docs = [
+        Document(
+            page_content=m.metadata.get("text", ""),
+            metadata={
+                "video_id": m.metadata.get("video_id", "Unknown ID"),
+                "video_title": m.metadata.get("video_title", "Unknown Video"),
+                "score": m.score,
+            },
         )
-    return retrieved_documents
+        for m in res.matches
+    ]
+    return docs
 
-def format_context(documents):
-    context_string = ""
-    video_references = set()
-    for i, doc in enumerate(documents):
-        cleaned_text = re.sub(r'^\s*[\n\s.]+', '', doc.page_content).strip()
-        context_string += f"--- Document {i+1} (From Video: {doc.metadata.get('video_title', 'N/A')}, Score: {doc.metadata.get('score'):.3f}) ---\n"
-        context_string += f"{cleaned_text}\n\n"
-        video_references.add(doc.metadata.get('video_title', 'Unknown Video'))
-    return context_string, list(video_references)
 
+def format_context(docs):
+    ctx, vids = "", set()
+    for i, d in enumerate(docs):
+        txt = re.sub(r"^\s*[\n\s.]+", "", d.page_content).strip()
+        ctx += (
+            f"--- Document {i + 1} "
+            f"(Video: {d.metadata.get('video_title', 'N/A')}, "
+            f"Score: {d.metadata.get('score'):.3f}) ---\n{txt}\n\n"
+        )
+        vids.add(d.metadata.get("video_title", "Unknown Video"))
+    return ctx, list(vids)
+
+
+# === Main Agent class ===
 class ImmersiveStoryAgent:
     def __init__(self):
         load_dotenv()
 
-        self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.oa = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-        pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        if not pinecone_api_key:
-            raise ValueError("PINECONE_API_KEY not set.")
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+        idx_name = "preprocessed-transcripts"
+        if idx_name not in [i.name for i in pc.list_indexes()]:
+            print(f"Warning: Pinecone index '{idx_name}' not found. Please ensure it's created and populated.")
+            self.index = None
+        else:
+            self.index = pc.Index(idx_name)
 
-        pc = Pinecone(api_key=pinecone_api_key)
-        self.index_name = "preprocessed-transcripts"
-        if self.index_name not in [index.name for index in pc.list_indexes()]:
-            raise FileNotFoundError(f"Pinecone index '{self.index_name}' not found.")
-        self.pinecone_index = pc.Index(self.index_name)
-
-        self.llm = ChatOpenAI(
-            model="gpt-4",
-            temperature=0.85,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-
-        self.qa_llm = ChatOpenAI(
-            model="gpt-4",
-            temperature=0.2,
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.llm = ChatOpenAI(model="gpt-4", temperature=0.85)
+        self.qa_llm = ChatOpenAI(model="gpt-4", temperature=0.2)
 
         self.story_prompt = PromptTemplate(
             input_variables=["question", "context", "video_references_list"],
             template="""
 You are a master storyteller guiding a vivid, immersive journey through ancient history.
 
-Only use information from the context. If it's not enough, say: "I can't answer that based on the available context."
+Create an engaging introduction that draws the listener into the location or topic: "{question}"
 
-Write like this:
-
-"Close your eyes and travel back in time..."
+Use ONLY the information in the context. If the context is insufficient,
+respond exactly: "I can't answer that based on the available context."
 
 ---
 
@@ -135,11 +158,12 @@ Question: {question}
 
 ---
 
-Now write the immersive story. Respond in this JSON format:
+Respond in this JSON format:
 
 {{
-  "story": "Your immersive story goes here",
-  "video_references": ["List of relevant video titles mentioned in the story"]
+  "story": "Your immersive story...",
+  "video_references": ["Video title 1","Video title 2"],
+  "suggested_followup": "A suggested follow-up question about this story"
 }}
 """
         )
@@ -147,7 +171,9 @@ Now write the immersive story. Respond in this JSON format:
         self.qa_prompt = PromptTemplate(
             input_variables=["question", "context"],
             template="""
-Answer the question using only the information from the context below. If you don't know the answer, say "I can't answer that based on the available context."
+Answer the question using ONLY the context below.
+If the context is insufficient, say exactly:
+"I can't answer that based on the available context."
 
 Context:
 {context}
@@ -160,201 +186,231 @@ Answer:"""
         self.qa_chain = LLMChain(llm=self.qa_llm, prompt=self.qa_prompt)
         self.memory = SimpleConversationMemory(max_history=4)
 
-    def generate_story(self, destination):
-        session_id = destination.lower().strip()
+        self.current_location = None
+        self.current_story = None
+        self.waiting_for_followup = False
+        self.followup_question = None
 
-        # Augment query with recent context for follow-ups
-        if self.memory.is_likely_followup(destination):
-            recent_context = self.memory.get_recent_context(session_id)
-            augmented_query = (recent_context + "\n\n" + destination) if recent_context else destination
-        else:
-            augmented_query = destination
-
-        print(f"🗺 Destination: {destination}")
-        print("🔍 Retrieving context...")
-
-        matches = retrieve_context(self.pinecone_index, augmented_query, self.openai_client, top_k=5)
-
-        if not matches:
+    def generate_story(self, topic):
+        self.current_location = topic
+        if not self.index:
             return {
-                "story": "I can't find enough information about that topic. Please try another destination or ask a specific question.",
-                "video_references": []
+                "story": "Pinecone index not available. Please check API keys and index name.",
+                "video_references": [],
+                "suggested_followup": None
+            }
+        docs = retrieve_context(self.index, topic, self.oa, top_k=5)
+        if not docs:
+            return {
+                "story": "I can't answer that based on the available context.",
+                "video_references": [],
+                "suggested_followup": None
             }
 
-        context, video_titles = format_context(matches)
-        print("📖 Generating immersive story...")
+        ctx, vids = format_context(docs)
+        if len(ctx.strip()) < 50:
+            return {
+                "story": "I can't answer that based on the available context.",
+                "video_references": [],
+                "suggested_followup": None
+            }
 
         try:
-            raw_output = self.story_chain.run(
-                question=augmented_query,
-                context=context,
-                video_references_list=", ".join(video_titles)
-            )
-            parsed = safe_parse_json(raw_output)
-            if not parsed or "story" not in parsed:
-                raise ValueError("Missing expected keys in story output")
+            raw = self.story_chain.invoke({
+                "question": topic,
+                "context": ctx,
+                "video_references_list": ", ".join(vids)
+            })
 
-            self.memory.add_qa_pair(destination, parsed['story'], session_id)
+            if hasattr(raw, "text"):
+                output = raw.text
+            elif hasattr(raw, "content"):
+                output = raw.content
+            elif isinstance(raw, dict) and "text" in raw:
+                output = raw["text"]
+            else:
+                output = str(raw)
 
+            parsed = safe_parse_json(output)
+
+            if not parsed or not parsed.get("story"):
+                raise ValueError("No story generated")
+
+            self.current_story = parsed["story"]
+            self.followup_question = parsed.get("suggested_followup")
+            self.waiting_for_followup = True if self.followup_question else False
+
+            self.memory.add_qa_pair(topic, parsed["story"], topic.lower())
             return parsed
+
         except Exception as e:
-            print("❌ Error during story generation:", e)
-            import traceback
             traceback.print_exc()
             return {
-                "story": "An error occurred while generating the story.",
-                "video_references": []
+                "story": f"An error occurred while generating the story: {str(e)}",
+                "video_references": [],
+                "suggested_followup": None
             }
 
     def answer_question(self, topic, question):
-        session_id = topic.lower().strip()
+        if not self.index:
+            return "Pinecone index not available. Please check API keys and index name."
 
-        if self.memory.is_likely_followup(question):
-            recent_context = self.memory.get_recent_context(session_id)
-            augmented_query = (recent_context + "\n\n" + question) if recent_context else question
-        else:
-            augmented_query = question
+        docs = retrieve_context(self.index, question, self.oa, top_k=5)
+        ctx, _ = format_context(docs)
 
-        matches = retrieve_context(self.pinecone_index, augmented_query, self.openai_client, top_k=5)
-        context, _ = format_context(matches)
+        if len(ctx.strip()) >= 50:
+            try:
+                resp = self.qa_chain.invoke({
+                    "question": question,
+                    "context": ctx
+                })
+
+                if hasattr(resp, "text"):
+                    answer_text = resp.text
+                elif hasattr(resp, "content"):
+                    answer_text = resp.content
+                elif isinstance(resp, dict) and "text" in resp:
+                    answer_text = resp["text"]
+                else:
+                    answer_text = str(resp)
+
+                if answer_text.strip():
+                    self.followup_question = self.ask_follow_up(answer_text)
+                    self.waiting_for_followup = True if self.followup_question else False
+                    return answer_text.strip()
+            except Exception:
+                traceback.print_exc()
 
         try:
-          answer = self.qa_chain.invoke({
-           "question": augmented_query,
-              "context": context
-}).content
-          return answer
-        except Exception as e:
-            print("❌ Error during answering:", e)
-            return "I can't answer that based on the available context."
+            fallback_resp = self.qa_llm.invoke(question)
+            answer_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
+            self.waiting_for_followup = False
+            return answer_text.strip()
+        except Exception:
+            traceback.print_exc()
+            return "I couldn't find an answer to that question."
 
-    def ask_follow_up(self, current_topic):
-        matches = retrieve_context(self.pinecone_index, current_topic, self.openai_client, top_k=3)
-        context, _ = format_context(matches)
-
-        prompt = f"""
-You are an expert historian. Based only on the context below, suggest one engaging follow-up question
-that would help the user continue exploring the story about "{current_topic}".
-
-If the context doesn't provide enough information for a good question, say "No suitable follow-up question found."
-
-Context:
-{context}
-"""
+    def ask_follow_up(self, snippet):
+        prompt = (
+            "Suggest ONE engaging follow-up question based only on this text:\n"
+            f"{snippet}\n\n"
+            "If no good question, reply: No suitable follow-up question found."
+        )
         try:
-            response = self.llm.invoke(prompt)
-            return response.content.strip()
-        except Exception as e:
-            print("❌ Error generating follow-up:", e)
-            return "No suitable follow-up question found."
+            resp = self.llm.invoke(prompt)
+            if hasattr(resp, "content"):
+                resp_text = resp.content.strip()
+            elif isinstance(resp, str):
+                resp_text = resp.strip()
+            else:
+                resp_text = str(resp).strip()
 
-def is_question(text):
-    question_words = [
-        "where", "what", "who", "when", "why", "how",
-        "is", "are", "do", "does", "did", "can", "could", "would", "should", "which"
-    ]
-    text = text.strip().lower()
-    return any(text.startswith(qw) for qw in question_words)
+            if resp_text.lower().startswith("no suitable"):
+                return None
+            return resp_text
+        except Exception:
+            traceback.print_exc()
+            return None
 
-# --- Gradio Interface Code ---
 
-# Global instance of the agent and conversation state
-# This is a common pattern for Gradio apps to maintain state across interactions
+# Global agent instance
 agent = ImmersiveStoryAgent()
-current_topic = gr.State(None)
-follow_up_question = gr.State(None)
-follow_up_mode = gr.State(False)
 
-def welcome_message():
-    return "🎭 Welcome to Immersive Storytelling! 🌍 Where would you like to go today? \n\n✨ Options: Great Pyramids, Roman Forum, Ancient Greece, Machu Picchu, Mesopotamia, Sangam Tamil Civilization"
 
-def process_input(user_input, chat_history, current_topic_state, follow_up_question_state, follow_up_mode_state):
-    history = chat_history or []
-    output_message = ""
-    new_follow_up_question = None
-    new_follow_up_mode = False
-    new_current_topic = current_topic_state
+def process_input(history, user_input):
+    global agent
 
-    if not user_input:
-        return history, current_topic_state, follow_up_question_state, follow_up_mode_state
+    chat_response = ""
 
-    user_input_lower = user_input.lower().strip()
+    if not user_input or not user_input.strip():
+        chat_response = "Please enter a location or a question."
+    else:
+        user_input = user_input.strip()
 
-    if user_input_lower in ["exit", "quit"]:
-        history.append((user_input, "👋 Thanks for exploring with us!"))
-        return history, None, None, False # Reset all states for exit
-    elif user_input_lower == "back":
-        if new_current_topic:
-            agent.memory.clear_session(new_current_topic.lower().strip())
-        output_message = "🔄 Let's pick a new destination!\n\n" + welcome_message()
-        history.append((user_input, output_message))
-        return history, None, None, False
+        # Heuristic: if input ends with question mark → question, else location/topic
+        if user_input.endswith("?"):
+            # It's a question
+            last_location = agent.current_location
 
-    if user_input_lower == "yes" and follow_up_question_state and follow_up_mode_state:
-        answer = agent.answer_question(new_current_topic, follow_up_question_state)
-        output_message = f"\n💬 Answer:\n {answer}"
-        new_follow_up_mode = False
-        new_follow_up_question = None # Clear follow-up question after answering
-        history.append((user_input, output_message))
-        return history, new_current_topic, new_follow_up_question, new_follow_up_mode
+            if last_location:
+                answer = agent.answer_question(last_location, user_input)
+                chat_response = f"Answer: {answer}"
+                if agent.followup_question:
+                    chat_response += f"\n\n**Suggested Follow-up:** {agent.followup_question}"
+            else:
+                # No current location context, try to answer anyway
+                answer = agent.answer_question("", user_input)
+                chat_response = f"Answer: {answer}"
 
-    if new_current_topic is None or (not is_question(user_input) and not follow_up_mode_state):
-        new_current_topic = user_input
-        story_output = agent.generate_story(new_current_topic)
-        story_text = story_output.get("story", "No story generated.")
-        video_refs = ", ".join(story_output["video_references"]) if story_output.get("video_references") else "No specific video references."
-        output_message = f"\n📚 Your Immersive Journey Begins:\n\n📝 Story:\n {story_text}\n\n🎬 Referenced Videos: {video_refs}"
+            tts_manager.speak(chat_response)
 
-        new_follow_up_question = agent.ask_follow_up(new_current_topic)
-        if new_follow_up_question and new_follow_up_question.lower() != "no suitable follow-up question found.":
-            output_message += f"\n\n🤔 Follow-up: do you want to know {new_follow_up_question}? (yes/no)"
-            new_follow_up_mode = True
         else:
-            new_follow_up_mode = False
-            new_follow_up_question = None # Ensure it's None if no suitable question
-    elif is_question(user_input):
-        answer = agent.answer_question(new_current_topic, user_input)
-        output_message = f"\n💬 Answer:\n {answer}"
-        new_follow_up_mode = False
-        new_follow_up_question = None # Clear follow-up question if a new direct question is asked
-    else: # User input is not a question and not a "yes" for follow-up, implies continuation of story
-        enriched_topic = f"{new_current_topic} {user_input}"
-        story_output = agent.generate_story(enriched_topic)
-        story_text = story_output.get("story", "No story generated.")
-        video_refs = ", ".join(story_output["video_references"]) if story_output.get("video_references") else "No specific video references."
-        output_message = f"\n📖 The Story Continues:\n\n📝 Story:\n {story_text}\n\n🎬 Referenced Videos: {video_refs}"
+            # Treat as location/topic input (no question mark)
+            response = agent.generate_story(user_input)
+            chat_response = response['story']
+            video_references_str = ", ".join(response['video_references']) if response['video_references'] else "N/A"
+            suggested_followup_str = response['suggested_followup'] if response['suggested_followup'] else "None"
 
-        new_follow_up_question = agent.ask_follow_up(new_current_topic)
-        if new_follow_up_question and new_follow_up_question.lower() != "no suitable follow-up question found.":
-            output_message += f"\n\n🤔 Follow-up: do you want to know {new_follow_up_question}? (yes/no)"
-            new_follow_up_mode = True
-        else:
-            new_follow_up_mode = False
-            new_follow_up_question = None # Ensure it's None if no suitable question
+            # Update current_location to the new input topic
+            agent.current_location = user_input
 
-    history.append((user_input, output_message))
-    return history, new_current_topic, new_follow_up_question, new_follow_up_mode
+            tts_manager.speak(chat_response)
+
+            if video_references_str != "N/A":
+                chat_response += f"\n\n**Referenced Videos:** {video_references_str}"
+            if suggested_followup_str != "None":
+                chat_response += f"\n\n**Suggested Follow-up:** {suggested_followup_str}"
+            chat_response += f"\n\n**Current Location:** {agent.current_location}"
+
+    history = history + [[user_input, chat_response]]
+
+    return history, gr.Textbox(value="", placeholder="Enter a location or ask a question (e.g., 'Great Pyramids' or 'What is the Roman Forum?')", interactive=True)
+
+
+def stop_audio():
+    tts_manager.stop()
+    return []  # No output, just performs an action
+
 
 # Gradio Interface
-with gr.Blocks(title="Immersive Historical Storyteller") as demo:
-    gr.Markdown("# 🎭 Immersive Historical Storyteller Chatbot")
-    gr.Markdown(welcome_message())
-
-    chatbot = gr.Chatbot(label="Conversation")
-    msg = gr.Textbox(label="Your Input", placeholder="Type your destination or question...")
-
-    # Using gr.State to maintain session-specific data
-    current_topic_state = gr.State(None)
-    follow_up_question_state = gr.State(None)
-    follow_up_mode_state = gr.State(False)
-
-    msg.submit(
-        process_input,
-        [msg, chatbot, current_topic_state, follow_up_question_state, follow_up_mode_state],
-        [chatbot, current_topic_state, follow_up_question_state, follow_up_mode_state]
+with gr.Blocks(title="Immersive Storytelling") as demo:
+    gr.Markdown(
+        """
+        # 🎭 Welcome to Immersive Storytelling!
+        ### 🌍 Enter any location or topic to start your journey or ask any question directly.
+        """
     )
-    # Clear button to reset the conversation
-    clear_button = gr.Button("Clear Conversation & Reset")
-    clear_button.click(lambda: ([], None, None, False), None, [chatbot, current_topic_state, follow_up_question_state, follow_up_mode_state])
+
+    chatbot = gr.Chatbot(label="Immersive Journey", height=500)
+
+    with gr.Row():
+        user_input_text = gr.Textbox(
+            label="Your Input",
+            placeholder="Enter a location (e.g., 'Great Pyramids') or ask a question (e.g., 'What is the Roman Forum?')",
+            interactive=True,
+            scale=4
+        )
+        submit_button = gr.Button("Send", scale=1)
+
+    stop_audio_button = gr.Button("Stop Audio")
+
+    # Event handlers
+    submit_button.click(
+        fn=process_input,
+        inputs=[chatbot, user_input_text],
+        outputs=[chatbot, user_input_text]
+    )
+
+    user_input_text.submit(
+        fn=process_input,
+        inputs=[chatbot, user_input_text],
+        outputs=[chatbot, user_input_text]
+    )
+
+    stop_audio_button.click(
+        fn=stop_audio,
+        inputs=[],
+        outputs=[]
+    )
 
 demo.launch()
