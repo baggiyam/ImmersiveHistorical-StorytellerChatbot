@@ -1,0 +1,2 @@
+[mlflow.model_evaluator]
+giskard = giskard.integrations.mlflow.giskard_evaluator:GiskardEvaluator

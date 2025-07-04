@@ -10,5 +10,7 @@ __pycache__/
 *.zip
 *.mp4
 *.csv
+.myenv311
+.myenv2
 ImmersiveStoryTelling/audio_files/
 ./Users/bshanmugam/Documents/ImmersiveHistorical-StorytellerChatbot/transcripts/Users/bshanmugam/Documents/FinalStory/ImmersiveHistorical-StorytellerChatbot/audio_files

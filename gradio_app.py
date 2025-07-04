@@ -1,29 +1,26 @@
 import gradio as gr
 import os
 import time
-from dotenv import load_dotenv
-from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from langchain_community.vectorstores import Pinecone as PineconeVectorStore
-from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain.output_parsers import StructuredOutputParser, ResponseSchema
-import re
-import pyttsx3
-import uuid
 import json
 import traceback
-### Options: Great Pyramids, Roman Forum, Ancient Greece, Machu Picchu, Mesopotamia, Sangam Tamil Civilization, Rome
-# === TTSManager class ===
+import re
+import pyttsx3
+from dotenv import load_dotenv
+from openai import OpenAI
+from pinecone import Pinecone
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from langchain_core.documents import Document
+
+
+# --- Initialize TTS ---
 class TTSManager:
     def __init__(self, rate=150, volume=0.9):
         self.engine = pyttsx3.init()
         self.engine.setProperty("rate", rate)
         self.engine.setProperty("volume", volume)
-        self.speaking = False  # Track if speech is active
+        self.speaking = False
 
     def speak(self, text):
         if not text:
@@ -41,14 +38,10 @@ class TTSManager:
         if self.speaking:
             self.engine.stop()
             self.speaking = False
-            print("Audio stopped.")
 
-
-# Instantiate a single global TTS manager
 tts_manager = TTSManager()
 
-
-# === Safe JSON parser ===
+# --- Safe JSON parsing ---
 def safe_parse_json(llm_output: str):
     try:
         return json.loads(llm_output)
@@ -59,33 +52,12 @@ def safe_parse_json(llm_output: str):
         cleaned = re.sub(r"\n", "\\n", cleaned)
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print("❌ Still can't parse JSON after cleaning:", e)
-            print("🧾 Raw output:", llm_output)
+        except Exception as e:
+            print("JSON parsing error after cleaning:", e)
+            print("Raw output:", llm_output)
             return None
 
-
-# === Conversation memory ===
-class SimpleConversationMemory:
-    def __init__(self, max_history=4):
-        self.max_history = max_history
-        self.history = []
-
-    def add_qa_pair(self, question, answer, topic=None):
-        self.history.append({
-            'question': question,
-            'answer': answer,
-            'topic': topic,
-            'timestamp': time.time()
-        })
-        if len(self.history) > self.max_history:
-            self.history.pop(0)
-
-    def get_recent(self, count=1):
-        return self.history[-count:] if self.history else []
-
-
-# === Context retrieval functions ===
+# --- Context retrieval ---
 def retrieve_context(index, query, oa_client, top_k=5):
     emb = oa_client.embeddings.create(
         model="text-embedding-ada-002", input=[query]
@@ -105,7 +77,6 @@ def retrieve_context(index, query, oa_client, top_k=5):
     ]
     return docs
 
-
 def format_context(docs):
     ctx, vids = "", set()
     for i, d in enumerate(docs):
@@ -118,8 +89,23 @@ def format_context(docs):
         vids.add(d.metadata.get("video_title", "Unknown Video"))
     return ctx, list(vids)
 
+# --- Simple conversation memory ---
+class SimpleConversationMemory:
+    def __init__(self, max_history=4):
+        self.max_history = max_history
+        self.history = []
 
-# === Main Agent class ===
+    def add_qa_pair(self, question, answer, topic=None):
+        self.history.append({
+            'question': question,
+            'answer': answer,
+            'topic': topic,
+            'timestamp': time.time()
+        })
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+# --- Immersive Story Agent ---
 class ImmersiveStoryAgent:
     def __init__(self):
         load_dotenv()
@@ -129,7 +115,7 @@ class ImmersiveStoryAgent:
         pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         idx_name = "preprocessed-transcripts"
         if idx_name not in [i.name for i in pc.list_indexes()]:
-            print(f"Warning: Pinecone index '{idx_name}' not found. Please ensure it's created and populated.")
+            print(f"Warning: Pinecone index '{idx_name}' not found.")
             self.index = None
         else:
             self.index = pc.Index(idx_name)
@@ -172,6 +158,7 @@ Respond in this JSON format:
             input_variables=["question", "context"],
             template="""
 Answer the question using ONLY the context below.
+
 If the context is insufficient, say exactly:
 "I can't answer that based on the available context."
 
@@ -186,13 +173,11 @@ Answer:"""
         self.qa_chain = LLMChain(llm=self.qa_llm, prompt=self.qa_prompt)
         self.memory = SimpleConversationMemory(max_history=4)
 
-        self.current_location = None
         self.current_story = None
         self.waiting_for_followup = False
         self.followup_question = None
 
     def generate_story(self, topic):
-        self.current_location = topic
         if not self.index:
             return {
                 "story": "Pinecone index not available. Please check API keys and index name.",
@@ -232,7 +217,6 @@ Answer:"""
                 output = str(raw)
 
             parsed = safe_parse_json(output)
-
             if not parsed or not parsed.get("story"):
                 raise ValueError("No story generated")
 
@@ -251,7 +235,7 @@ Answer:"""
                 "suggested_followup": None
             }
 
-    def answer_question(self, topic, question):
+    def answer_question(self, question):
         if not self.index:
             return "Pinecone index not available. Please check API keys and index name."
 
@@ -275,8 +259,8 @@ Answer:"""
                     answer_text = str(resp)
 
                 if answer_text.strip():
-                    self.followup_question = self.ask_follow_up(answer_text)
-                    self.waiting_for_followup = True if self.followup_question else False
+                    self.waiting_for_followup = False
+                    self.memory.add_qa_pair(question, answer_text.strip())
                     return answer_text.strip()
             except Exception:
                 traceback.print_exc()
@@ -285,132 +269,103 @@ Answer:"""
             fallback_resp = self.qa_llm.invoke(question)
             answer_text = fallback_resp.content if hasattr(fallback_resp, "content") else str(fallback_resp)
             self.waiting_for_followup = False
+            self.memory.add_qa_pair(question, answer_text.strip())
             return answer_text.strip()
         except Exception:
             traceback.print_exc()
             return "I couldn't find an answer to that question."
 
-    def ask_follow_up(self, snippet):
-        prompt = (
-            "Suggest ONE engaging follow-up question based only on this text:\n"
-            f"{snippet}\n\n"
-            "If no good question, reply: No suitable follow-up question found."
-        )
-        try:
-            resp = self.llm.invoke(prompt)
-            if hasattr(resp, "content"):
-                resp_text = resp.content.strip()
-            elif isinstance(resp, str):
-                resp_text = resp.strip()
-            else:
-                resp_text = str(resp).strip()
-
-            if resp_text.lower().startswith("no suitable"):
-                return None
-            return resp_text
-        except Exception:
-            traceback.print_exc()
-            return None
-
-
-# Global agent instance
+# --- Global agent ---
 agent = ImmersiveStoryAgent()
 
+# --- Gradio Interface functions ---
+def respond(message, chat_history):
+    if not message or message.strip() == "":
+        return "", chat_history
 
-def process_input(history, user_input):
-    global agent
+    message = message.strip()
+    available_topics = [
+        "Great Pyramids", "Roman Forum", "Ancient Greece", "Machu Picchu",
+        "Mesopotamia", "Sangam Tamil Civilization", "Rome"
+    ]
 
-    chat_response = ""
+    # Check if user wants to start a story from a known topic
+    matched_topic = next((t for t in available_topics if t.lower() == message.lower()), None)
 
-    if not user_input or not user_input.strip():
-        chat_response = "Please enter a location or a question."
+    if matched_topic:
+        # Generate immersive story
+        story_data = agent.generate_story(matched_topic)
+        story = story_data.get("story", "")
+        video_refs = story_data.get("video_references", [])
+        followup = story_data.get("suggested_followup", None)
+
+        # Format the response
+        response = story
+        if video_refs:
+            response += f"\n\n📚 References: {', '.join(video_refs)}"
+        if followup:
+            response += f"\n\n🤔 Follow-up: {followup}"
+
+        chat_history.append((message, response))
+        return "", chat_history
     else:
-        user_input = user_input.strip()
+        # Treat as question to answer
+        answer = agent.answer_question(message)
+        chat_history.append((message, answer))
+        return "", chat_history
 
-        # Heuristic: if input ends with question mark → question, else location/topic
-        if user_input.endswith("?"):
-            # It's a question
-            last_location = agent.current_location
+def clear_chat():
+    agent.memory.history = []
+    return []
 
-            if last_location:
-                answer = agent.answer_question(last_location, user_input)
-                chat_response = f"Answer: {answer}"
-                if agent.followup_question:
-                    chat_response += f"\n\n**Suggested Follow-up:** {agent.followup_question}"
-            else:
-                # No current location context, try to answer anyway
-                answer = agent.answer_question("", user_input)
-                chat_response = f"Answer: {answer}"
+def on_play(text):
+    if text:
+        tts_manager.speak(text)
 
-            tts_manager.speak(chat_response)
-
-        else:
-            # Treat as location/topic input (no question mark)
-            response = agent.generate_story(user_input)
-            chat_response = response['story']
-            video_references_str = ", ".join(response['video_references']) if response['video_references'] else "N/A"
-            suggested_followup_str = response['suggested_followup'] if response['suggested_followup'] else "None"
-
-            # Update current_location to the new input topic
-            agent.current_location = user_input
-
-            tts_manager.speak(chat_response)
-
-            if video_references_str != "N/A":
-                chat_response += f"\n\n**Referenced Videos:** {video_references_str}"
-            if suggested_followup_str != "None":
-                chat_response += f"\n\n**Suggested Follow-up:** {suggested_followup_str}"
-            chat_response += f"\n\n**Current Location:** {agent.current_location}"
-
-    history = history + [[user_input, chat_response]]
-
-    return history, gr.Textbox(value="", placeholder="Enter a location or ask a question (e.g., 'Great Pyramids' or 'What is the Roman Forum?')", interactive=True)
-
-
-def stop_audio():
+def on_stop():
     tts_manager.stop()
-    return []  # No output, just performs an action
 
+# --- Markdown list of available topics ---
+available_topics_md = """
+### Available Topics (type exactly to start a story):
 
-# Gradio Interface
-with gr.Blocks(title="Immersive Storytelling") as demo:
-    gr.Markdown(
-        """
-        # 🎭 Welcome to Immersive Storytelling!
-        ### 🌍 Enter any location or topic to start your journey or ask any question directly.
-        """
-    )
+- Great Pyramids
+- Roman Forum
+- Ancient Greece
+- Machu Picchu
+- Mesopotamia
+- Sangam Tamil Civilization
+- Rome
 
-    chatbot = gr.Chatbot(label="Immersive Journey", height=500)
+Type any of the above topic names exactly to hear an immersive story,
+or ask any question about these topics or ancient history in general.
+"""
+
+# --- Build Gradio app ---
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🏛️ Immersive Ancient History Storyteller")
+    gr.Markdown(available_topics_md)
 
     with gr.Row():
-        user_input_text = gr.Textbox(
-            label="Your Input",
-            placeholder="Enter a location (e.g., 'Great Pyramids') or ask a question (e.g., 'What is the Roman Forum?')",
-            interactive=True,
-            scale=4
-        )
-        submit_button = gr.Button("Send", scale=1)
+        with gr.Column(scale=3):
+            chatbot = gr.Chatbot(height=500, bubble_full_width=False)
+            msg = gr.Textbox(label="Your message", placeholder="Type a topic or question...")
 
-    stop_audio_button = gr.Button("Stop Audio")
+            with gr.Row():
+                submit_btn = gr.Button("Submit", variant="primary")
+                clear_btn = gr.Button("Clear History")
+
+        with gr.Column(scale=1):
+            gr.Markdown("### Audio Controls")
+            with gr.Row():
+                play_btn = gr.Button("▶ Play Last Response")
+                stop_btn = gr.Button("■ Stop Audio")
 
     # Event handlers
-    submit_button.click(
-        fn=process_input,
-        inputs=[chatbot, user_input_text],
-        outputs=[chatbot, user_input_text]
-    )
-
-    user_input_text.submit(
-        fn=process_input,
-        inputs=[chatbot, user_input_text],
-        outputs=[chatbot, user_input_text]
-    )
-
-    stop_audio_button.click(
-        fn=stop_audio,
-        inputs=[],
-        outputs=[]
-    )
+    msg.submit(respond, [msg, chatbot], [msg, chatbot])
+    submit_btn.click(respond, [msg, chatbot], [msg, chatbot])
+    clear_btn.click(clear_chat, [], [chatbot])
+    play_btn.click(on_play, chatbot, [])
+    stop_btn.click(on_stop, [], [])
 
 demo.launch()
