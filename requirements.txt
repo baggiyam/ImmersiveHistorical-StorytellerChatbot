@@ -5,3 +5,9 @@ pinecone
 pyttsx3
 ipython
 langchain-community
+openai
+gradio
+python-dotenv
+langchain
+pinecone-client
+pyttsx3
